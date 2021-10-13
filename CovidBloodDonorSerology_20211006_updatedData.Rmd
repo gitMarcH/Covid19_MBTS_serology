@@ -1,0 +1,1291 @@
+---
+title: "SARS-COV2 blood donors serology project"
+author: "Marc Henrion, Jonathan Mandolo, Brewster Moyo"
+date: "6 October 2021"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, fig.width=12, fig.height=6.75)
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(gtsummary)
+library(broom)
+library(gridExtra)
+library(lubridate)
+library(bootComb)
+library(rms)
+library(mgcv)
+library(sf)
+library(rgdal)
+library(raster)
+library(ggthemes)
+library(ggforce)
+library(readstata13)
+library(splines)
+
+outDir<-paste(sep="/","output",gsub(pattern="-",replacement="",Sys.Date()))
+if(!exists(outDir)){dir.create(outDir,recursive=T)}
+
+
+# ## To-do list
+# 
+# * Sumamrise / explore data
+# * Estimate and adjust for sensitivity / specificity seroprevalence at each time point and location
+# * Fit flexible model to seroprevalence data over time (smooth seroprevalence curves) -- per site and one hiearchical / mixed model for the whole dataset
+# * Bubble plots showing seroprevalence at each site
+# * Get census data and weight by age group, adjust for ~2% increase per year
+# * Seroprevalence against age (needs some thinking; easily confounded with time if, e.g. older folks decided to sel-isolate once Covid emergency declared and fewer of them showed up during the high seroprevalence periods)
+# * OD over time
+# * Explore difference between blood groups
+```
+
+## License
+
+This code and its content is made available under an MIT license, (c) 2021 Marc Henrion.
+See details of the license on the GitHub repository (https://github.com/gitMarcH/Covid19_MBTS_serology).
+
+## Read the data
+
+```{r loadData}
+datFile<-"../20210323_Data/MBTS_data.dta"
+datFileNew<-"../20210827_Data/march_july_JM_20210827.csv"
+datCorrectionsFile<-"../20210412_DataCorrections/BDCOVID_borderline samples.csv"
+datCorrectionsFileNew<-"../20211004_Data/borderlinesamples.csv"
+malawiDatFile<-"../20210323_Data/gadm36_MWI_1_sp.rds" # shapefile
+datOccupFile<-"../20210521_OccupationData/metadata occupation_.csv"
+datPopCensusProjFile<-"../../NSO/Census2018_PopulationProjections/NSO_Census2018_PopulationProjections2018-2021.csv"
+
+# original data
+dat<-read.dta13(datFile)
+colnames(dat)[colnames(dat)=="donation_date"]<-"date"
+dat$date<-ymd(dat$date)
+dat$month<-paste(sep="-",year(dat$date),formatC(month(dat$date), width = 2, format = "d", flag = "0"))
+dat$results<-factor(as.character(dat$results),levels=c("Negative","Borderline","Positive"))
+dat$dob<-ymd(dat$dob)
+dat<-dat[dat$date>=ymd("2020-01-01"),]
+dat$ODCutoff<-as.numeric(dat$ODCutoff)
+dat<-dat %>% mutate(occupation=NA)
+dat$gender<-factor(as.character(dat$gender),levels=c("Female","Male")) # just flipping what is the reference level
+
+# new data (2021-03 - 2021-07)
+datNew<-read.csv(datFileNew)
+datNew$donation_number<-paste(sep="","0",datNew$donation_number)
+colnames(datNew)[colnames(datNew)=="donation_date"]<-"date"
+#colnames(datNew)[colnames(datNew)=="OD"]<-"ODCutoff"
+datNew$date<-dmy(datNew$date)
+datNew$dob<-dmy(datNew$dob)
+datNew$occupation<-tolower(datNew$occupation)
+datNew$gender<-fct_recode(factor(as.character(datNew$gender),levels=c("F","M")),Female="F",Male="M") # just flipping what is the reference level
+
+datNew<-datNew %>%
+  mutate(
+    month=paste(sep="-",year(date),formatC(month(date), width = 2, format = "d", flag = "0")),
+    results=fct_recode(factor(as.character(results),levels=c("neg","borderline","pos")),Negative="neg",Borderline="borderline",Positive="pos")
+  ) %>%
+  dplyr::select(colnames(dat))
+
+# merge
+dat<-bind_rows(dat,datNew) # 5,085 observations
+
+# correct the 17 borderline results with results from different assay
+datCorr<-read.csv(datCorrectionsFile)
+datCorr$donation<-paste(sep="","0",datCorr$donation)
+
+dat$results[match(datCorr$donation,dat$donation_number)]<-case_when(datCorr$final.result=="neg"~"Negative",datCorr$final.result=="pos"~"Positive")
+
+# correct the 15 borderline samples from the new data
+datCorrNew<-read.csv(datCorrectionsFileNew)
+datCorrNew$donation_number<-paste(sep="","0",datCorrNew$donation_number)
+
+dat$results[match(datCorrNew$donation_number,dat$donation_number)]<-case_when(datCorrNew$final=="neg"~"Negative",datCorrNew$final=="pos"~"Positive")
+
+dat$results[dat$donation_number=="0784140"]<-"Negative" # as advised by Jonathan in email from 7 May 2021 after asking about this sample given OD=0 yet 'Positive' result
+dat$results[dat$donation_number=="0784124"]<-"Positive" # Jonathan confirmed this one was a false negative and should be positive
+
+dat$seropos<-ifelse(dat$results=="Positive",1,0)
+
+datOccup<-read.csv(datOccupFile)
+colnames(datOccup)[colnames(datOccup)=="PACK.NUMBER"]<-"donation_number"
+datOccup$donation_number<-paste(sep="","0",datOccup$donation_number)
+datOccup$OCCUPATION<-tolower(datOccup$OCCUPATION)
+
+dat$occupation[match(datOccup$donation_number,dat$donation_number)]=datOccup$OCCUPATION
+
+# need to correct dates of birth that were mapped to the wrong century given that DOB year was reported only to 2 digits
+dat$dob[ymd(dat$dob)>ymd("2020-01-01")]<-gsub(pattern="^20",replacement="19",dat$dob[ymd(dat$dob)>ymd("2020-01-01")])
+
+# need to manually correct 2 dates of birth - as per email from MBTS on 01/09/2021 at 11.03am
+dat$dob[dat$donation_number=="0770314"]<-dmy("05/05/2001")
+dat$dob[dat$donation_number=="0842762"]<-dmy("08/03/1999")
+
+dat<-dat %>%
+  mutate(
+    age_calendar=as.period(interval(start=ymd(dob),end=ymd(date))),
+    age_years=as.period(interval(start=ymd(dob),end=ymd(date)))$year
+  )
+
+# read the census population projection data
+datPopCensusProj<-read.csv(datPopCensusProjFile) # these give the mid-year projections - we'll take that to be the 1st of July each year
+
+# calculate population weights from the census data for the adult population in Malawi (maybe 16+ - need to check age range in dataset...)
+datPopCensusWeights<-list()
+
+for(mth in sort(unique(dat$month))){
+  if(mth=="2020-07"){
+    datPopCensusWeights[[mth]]<-datPopCensusProj %>%
+      dplyr::filter(Year==2020 & AgeGroup %in% c("15-19","20-24","25-29","30-34","35-39","40-44","45-49","50-54","55-59","60-64"))
+  }else if(mth=="2021-07"){
+    datPopCensusWeights[[mth]]<-datPopCensusProj %>%
+      dplyr::filter(Year==2021 & AgeGroup %in% c("15-19","20-24","25-29","30-34","35-39","40-44","45-49","50-54","55-59","60-64"))
+  }else{
+    tmp<-as.integer(unlist(strsplit(split="-",mth)))
+    yr<-tmp[1]
+    mo<-tmp[2]
+    w<-1-(((mo-7) %% 12)/12)
+    if(mo<7){
+      tmp1<-datPopCensusProj %>%
+        dplyr::filter(Year==yr-1 & AgeGroup %in% c("15-19","20-24","25-29","30-34","35-39","40-44","45-49","50-54","55-59","60-64"))
+      tmp2<-datPopCensusProj %>%
+        dplyr::filter(Year==yr & AgeGroup %in% c("15-19","20-24","25-29","30-34","35-39","40-44","45-49","50-54","55-59","60-64"))
+    }else{
+      tmp1<-datPopCensusProj %>%
+        dplyr::filter(Year==yr & AgeGroup %in% c("15-19","20-24","25-29","30-34","35-39","40-44","45-49","50-54","55-59","60-64"))
+      tmp2<-datPopCensusProj %>%
+        dplyr::filter(Year==yr+1 & AgeGroup %in% c("15-19","20-24","25-29","30-34","35-39","40-44","45-49","50-54","55-59","60-64"))
+    }
+    datPopCensusWeights[[mth]]<-data.frame(
+      Year=yr,
+      AgeGroup=tmp1$AgeGroup,
+      BothSex=w*tmp1$BothSex+(1-w)*tmp2$BothSex,
+      Male=w*tmp1$Male+(1-w)*tmp2$Male,
+      Female=w*tmp1$Female+(1-w)*tmp2$Female
+    )
+  }
+}
+
+totPop_15yrs63yrs<-list()
+for(mth in names(datPopCensusWeights)){
+  totPop_15yrs63yrs[[mth]]<-colSums(datPopCensusWeights[[mth]] %>% dplyr::select(BothSex,Male,Female))
+  
+  datPopCensusWeights[[mth]]<-datPopCensusWeights[[mth]] %>% mutate(
+    PropBothSex=BothSex/totPop_15yrs63yrs[[mth]]["BothSex"],
+    PropMale=Male/totPop_15yrs63yrs[[mth]]["Male"],
+    PropFemale=Female/totPop_15yrs63yrs[[mth]]["Female"]
+  ) %>%
+    pivot_longer(
+      cols=c(PropMale,PropFemale),
+      names_to="sex",
+      values_to="prop" # we will overwrite this
+    ) %>%
+    mutate(
+      prop=case_when(
+        sex=="PropMale"~Male/totPop_15yrs63yrs[[mth]]["BothSex"],
+        sex=="PropFemale"~Female/totPop_15yrs63yrs[[mth]]["BothSex"]
+      )
+    )
+}
+
+dat<-dat %>% mutate(
+  age_group=case_when(
+    age_years>=15 & age_years<20~"15-19",
+    age_years>=20 & age_years<25~"20-24",
+    age_years>=25 & age_years<30~"25-29",
+    age_years>=30 & age_years<35~"30-34",
+    age_years>=35 & age_years<40~"35-39",
+    age_years>=40 & age_years<45~"40-44",
+    age_years>=45 & age_years<50~"45-49",
+    age_years>=50 & age_years<55~"50-54",
+    age_years>=54 & age_years<60~"55-59",
+    age_years>=60 & age_years<65~"60-64",
+    TRUE~NA_character_
+  )
+)
+
+datProps<-expand.grid(unique(dat$age_group),unique(dat$gender),unique(dat$month),unique(dat$location))
+colnames(datProps)<-c("age_group","sex","month","location")
+
+datProps<-datProps %>%
+  mutate(
+    prop=NA,
+    propCensus=NA,
+    sampWeight=NA
+  )
+
+for(j in 1:nrow(datProps)){
+  datProps$prop[j]<-sum(dat$gender==datProps$sex[j] & dat$age_group==datProps$age_group[j] & dat$month==datProps$month[j] & dat$location==datProps$location[j])/sum(dat$month==datProps$month[j] & dat$location==datProps$location[j])
+  datProps$propCensus[j]<-datPopCensusWeights[[datProps$month[j]]]$prop[datPopCensusWeights[[datProps$month[j]]]$AgeGroup==datProps$age_group[j] & datPopCensusWeights[[datProps$month[j]]]$sex==paste(sep="","Prop",datProps$sex[j])]
+  datProps$sampWeight[j]<-datProps$propCensus[j]/datProps$prop[j]
+}
+datProps$sampWeight[abs(datProps$sampWeight)==Inf]<-NA
+
+dat<-dat %>%
+  mutate(sampWeight=NA)
+
+for(j in 1:nrow(dat)){
+  dat$sampWeight[j]<-datProps$sampWeight[datProps$sex==dat$gender[j] & datProps$age_group==dat$age_group[j] & datProps$month==dat$month[j] & datProps$location==dat$location[j]]
+}
+
+datProps<-datProps[order(ym(datProps$month),datProps$sex,datProps$age_group),]
+
+write.csv(dat,row.names=F,quote=F,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),paste(sep="","MBTS_Covid19_CombinedCleanedData_",gsub(pattern="-",replacement="",Sys.Date()),".csv"))))
+```
+
+There are `r nrow(dat)` observations in the dataset, of which `r sum(is.na(dat$date))` have no date information, `r sum(is.na(dat$ODCutoff))` have no OD information and `r sum(is.na(dat$results))` have no seropositivity status. The date range spans `r min(dat$date)` to `r max(dat$date)`. There are `r sum(rowSums(is.na(dat))>0)` observations with missing data.
+
+## Assay performance characteristics
+
+There are manufacturer and independently reported sensitivity and specificity for the Wantai SARS-COV2 serology assay. These are given in the table below.
+For this analysis we are using the independently reported estimates for now.
+
+```{r analysisParameters}
+assaySensMf<-c(251,266)
+assaySpecMf<-c(306,306)
+assaySensInd<-c(29,30)
+assaySpecInd<-c(78,80)
+
+df<-data.frame(
+  evaluation=c("Manufacturer","Independent"),
+  knSens=c(paste(collapse="/",assaySensMf),paste(collapse="/",assaySensInd)),
+  knSpec=c(paste(collapse="/",assaySpecMf),paste(collapse="/",assaySpecInd)),
+  sens=c(paste(sep="",format(nsmall=2,round(digits=2,assaySensMf[1]/assaySensMf[2]))," (",paste(collapse=",",format(nsmall=2,round(digits=2,binom.test(assaySensMf[1],assaySensMf[2])$conf.int))),")"),
+         paste(sep="",format(nsmall=2,round(digits=2,assaySensInd[1]/assaySensInd[2]))," (",paste(collapse=",",format(nsmall=2,round(digits=2,binom.test(assaySensInd[1],assaySensInd[2])$conf.int))),")")),
+  spec=c(paste(sep="",format(nsmall=2,round(digits=2,assaySpecMf[1]/assaySpecMf[2]))," (",paste(collapse=",",format(nsmall=2,round(digits=2,binom.test(assaySpecMf[1],assaySpecMf[2])$conf.int))),")"),
+         paste(sep="",format(nsmall=2,round(digits=2,assaySpecInd[1]/assaySpecInd[2]))," (",paste(collapse=",",format(nsmall=2,round(digits=2,binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int))),")"))
+)
+
+df %>%
+  kable(col.names = c("","k/n (sensitivity)","k/n (specificity)","sensitivity (95% CI)","specificity (95% CI)")) %>%
+  kable_styling(full_width=FALSE)
+```
+
+
+## Population weights calculated from census data
+
+We will use the National Statistics Office (NSO) 2018 Malawi Population and Housing Census Population Projections 2018-2050 estimates for 2019, 2020 and 2021 to calculate post-stratification population weights (the projections are for the mid-year point and we linearly interpolate on a monthly basis). These weights take 5-year age group, sex and month of donation into account. Month of donation is included as the age group and sex distribution of the donations can change considerably from month to month. The age range in the MBTS data spans from 15 years to 63 years. For this reason we used 5-year age band from 15-19 up to 60-64. The total population size is calculated for these age bands only.
+
+The table below shows the first 20 rows of the population weights used to compute the estimate of the overall seroprevalence and for weighting. The full table has 380 rows and is not shown here, but can be made available.
+
+```{r sampWeights}
+head(datProps,n=20) %>% 
+  kable(col.names=c("Age group","Sex","Month of donation","Location","Proportion of age-sex group in MBTS data","Proportion of age-sex group in census projection","Population weight"),digits=4) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## Data summary
+
+A quick summary of some of the variables in the dataset are listed below, stratified by time & place.
+
+```{r sumTab}
+sumAll<-dat %>%
+  dplyr::summarise(n_total = n(),
+            age_median = format(nsmall=1,round(digits=1,median(age))),
+            age_IQR = paste(sep="","(",paste(collapse=",",format(nsmall=1,round(digits=1,quantile(age,probs=c(0.25,0.75))))),")"),
+            female_perc = paste(sep="",format(nsmall=1,round(digits=1,100*sum(gender == "Female")/sum(!is.na(gender)))),"%"),
+            seropos_n=sum(seropos==1),
+            seropos_prop=sum(seropos==1)/sum(!is.na(seropos))
+)
+sumAll<-sumAll %>% mutate(seropos_propAdj=adjPrevSensSpec(seropos_prop, assaySensInd[1]/assaySensInd[2], assaySpecInd[1]/assaySpecInd[2], replaceImpossibleValues = TRUE))
+sumAll$seropos_prop<-paste(sep="",format(nsmall=1,round(digits=1,100*sumAll$seropos_prop)),"%")
+sumAll$seropos_propAdj<-paste(sep="",format(nsmall=1,round(digits=1,100*sumAll$seropos_propAdj)),"%")
+
+sumLocation<-dat %>%
+  group_by(location) %>%
+  dplyr::summarise(n_total = n(),
+            age_median = format(nsmall=1,round(digits=1,median(age))),
+            age_IQR = paste(sep="","(",paste(collapse=",",format(nsmall=1,round(digits=1,quantile(age,probs=c(0.25,0.75))))),")"),
+            female_perc = paste(sep="",format(nsmall=1,round(digits=1,100*sum(gender == "Female")/sum(!is.na(gender)))),"%"),
+            seropos_n=sum(seropos==1),
+            seropos_prop=sum(seropos==1)/sum(!is.na(seropos))
+)
+sumLocation<-sumLocation %>% mutate(seropos_propAdj=adjPrevSensSpec(seropos_prop, assaySensInd[1]/assaySensInd[2], assaySpecInd[1]/assaySpecInd[2], replaceImpossibleValues = TRUE))
+sumLocation$seropos_prop<-paste(sep="",format(nsmall=1,round(digits=1,100*sumLocation$seropos_prop)),"%")
+sumLocation$seropos_propAdj<-paste(sep="",format(nsmall=1,round(digits=1,100*sumLocation$seropos_propAdj)),"%")
+
+sumLocation<-rbind(
+  data.frame(location="All samples",sumAll),
+  sumLocation
+)
+
+# sumLocation %>%
+#   dplyr::select(!seropos_prop) %>%
+#   kable(col.names=c("Location","Number of samples","Age (median)","Age (IQR)","Females (%)","Seropositives (frequency)","Seropositives, adjusted (%)"),caption="Summary statistics for all samples and by location over the entire period (2020-01 to 2021-07). The seropositive percentage has been adjusted for the assay sensitivity and specificity.") %>%
+#   kable_styling(full_width = FALSE)
+
+sumMonth<-dat %>%
+  group_by(month) %>%
+  dplyr::summarise(n_total = n(),
+            age_median = format(nsmall=1,round(digits=1,median(age))),
+            age_IQR = paste(sep="","(",paste(collapse=",",format(nsmall=1,round(digits=1,quantile(age,probs=c(0.25,0.75))))),")"),
+            female_perc = paste(sep="",format(nsmall=1,round(digits=1,100*sum(gender == "Female")/sum(!is.na(gender)))),"%"),
+            seropos_n=sum(seropos==1),
+            seropos_prop=sum(seropos==1)/sum(!is.na(seropos))
+)
+sumMonth<-sumMonth %>% mutate(seropos_propAdj=adjPrevSensSpec(seropos_prop, assaySensInd[1]/assaySensInd[2], assaySpecInd[1]/assaySpecInd[2], replaceImpossibleValues = TRUE))
+sumMonth$seropos_prop<-paste(sep="",format(nsmall=1,round(digits=1,100*sumMonth$seropos_prop)),"%")
+sumMonth$seropos_propAdj<-paste(sep="",format(nsmall=1,round(digits=1,100*sumMonth$seropos_propAdj)),"%")
+
+sumMonth<-data.frame(location="All samples",sumMonth)
+
+sumMonthLocation<-list()
+for(loc in sort(unique(dat$location))){
+  sumMonthLocation[[loc]]<-dat %>%
+    dplyr::filter(location==loc) %>%
+    group_by(month) %>%
+    dplyr::summarise(n_total = n(),
+                     age_median = format(nsmall=1,round(digits=1,median(age))),
+                     age_IQR = paste(sep="","(",paste(collapse=",",format(nsmall=1,round(digits=1,quantile(age,probs=c(0.25,0.75))))),")"),
+                     female_perc = paste(sep="",format(nsmall=1,round(digits=1,100*sum(gender == "Female")/sum(!is.na(gender)))),"%"),
+                     seropos_n=sum(seropos==1),
+                     seropos_prop=sum(seropos==1)/sum(!is.na(seropos))
+    )
+  sumMonthLocation[[loc]]<-sumMonthLocation[[loc]] %>% mutate(seropos_propAdj=adjPrevSensSpec(seropos_prop, assaySensInd[1]/assaySensInd[2], assaySpecInd[1]/assaySpecInd[2], replaceImpossibleValues = TRUE))
+  sumMonthLocation[[loc]]$seropos_prop<-paste(sep="",format(nsmall=1,round(digits=1,100*sumMonthLocation[[loc]]$seropos_prop)),"%")
+  sumMonthLocation[[loc]]$seropos_propAdj<-paste(sep="",format(nsmall=1,round(digits=1,100*sumMonthLocation[[loc]]$seropos_propAdj)),"%")
+  
+  #colnames(sumMonthLocation[[loc]])[-1]<-paste(sep=".",colnames(sumMonthLocation[[loc]])[-1],loc)
+  #sumMonth<-left_join(sumMonth,sumMonthLocation[[loc]],by="month")
+  sumMonth<-rbind(sumMonth,data.frame(location=loc,sumMonthLocation[[loc]]))
+}
+```
+
+```{r adjustSeroprev}
+datPropAll<-dat %>%
+  dplyr::summarise(seroposprop=mean(seropos),
+            seropospropLow=binom.test(sum(seropos),n())$conf.int[1],
+            seropospropHigh=binom.test(sum(seropos),n())$conf.int[2],.groups="drop")
+
+for(i in 1:nrow(datPropAll)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datPropAll$seropospropLow[i],datPropAll$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datPropAll$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  datPropAll$seropospropAdj[i]<-tmp$estimate
+  datPropAll$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datPropAll$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+datProp<-dat %>%
+  group_by(month) %>%
+  dplyr::summarise(seroposprop=mean(seropos),
+            seropospropLow=binom.test(sum(seropos),n())$conf.int[1],
+            seropospropHigh=binom.test(sum(seropos),n())$conf.int[2],.groups="drop")
+
+datProp$seropospropAdj<-NA
+datProp$seropospropAdjLow<-NA
+datProp$seropospropAdjHigh<-NA
+
+for(i in 1:nrow(datProp)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datProp$seropospropLow[i],datProp$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datProp$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  datProp$seropospropAdj[i]<-tmp$estimate
+  datProp$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datProp$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+# datProp$seropospropAdjLow[datProp$seropospropAdjLow<=0 | datProp$seropospropAdj<=0]<-0
+# datProp$seropospropAdj[datProp$seropospropAdj<=0]<-0
+
+datPropStrat<-dat %>%
+  group_by(month,location) %>%
+  dplyr::summarise(seroposprop=mean(seropos),
+            seropospropLow=binom.test(sum(seropos),n())$conf.int[1],
+            seropospropHigh=binom.test(sum(seropos),n())$conf.int[2],.groups="drop")
+
+datPropStrat$seropospropAdj<-NA
+datPropStrat$seropospropAdjLow<-NA
+datPropStrat$seropospropAdjHigh<-NA
+
+for(i in 1:nrow(datPropStrat)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datPropStrat$seropospropLow[i],datPropStrat$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datPropStrat$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e6)
+  datPropStrat$seropospropAdj[i]<-tmp$estimate
+  datPropStrat$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datPropStrat$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+# datPropStrat$seropospropAdjLow[datPropStrat$seropospropAdjLow<=0 | datPropStrat$seropospropAdj<=0]<-0
+# datPropStrat$seropospropAdj[datPropStrat$seropospropAdj<=0]<-0
+
+datPropBl<-datPropStrat %>% dplyr::filter(location=="Balaka")
+datPropBt<-datPropStrat %>% dplyr::filter(location=="Blantyre")
+datPropLl<-datPropStrat %>% dplyr::filter(location=="Lilongwe")
+datPropMz<-datPropStrat %>% dplyr::filter(location=="Mzuzu")
+
+
+tab2Paper<-data.frame(
+  month=gsub(seq(ym("2020-01"),ym("2021-07"),by="month"),pattern="-01$",replacement=""),
+  Balaka=NA,
+  Blantyre=NA,
+  Lilongwe=NA,
+  Mzuzu=NA,
+  Total=NA
+) %>%
+  mutate(
+    Balaka=paste(sep="",format(nsmall=1,round(digits=1,100*datPropBl$seropospropAdj[match(month,datPropBl$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropBl$seropospropAdjLow[match(month,datPropBl$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropBl$seropospropAdjHigh[match(month,datPropBl$month)])),"%)"),
+    Blantyre=paste(sep="",format(nsmall=1,round(digits=1,100*datPropBt$seropospropAdj[match(month,datPropBt$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropBt$seropospropAdjLow[match(month,datPropBt$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropBt$seropospropAdjHigh[match(month,datPropBt$month)])),"%)"),
+    Lilongwe=paste(sep="",format(nsmall=1,round(digits=1,100*datPropLl$seropospropAdj[match(month,datPropLl$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropLl$seropospropAdjLow[match(month,datPropLl$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropLl$seropospropAdjHigh[match(month,datPropLl$month)])),"%)"),
+    Mzuzu=paste(sep="",format(nsmall=1,round(digits=1,100*datPropMz$seropospropAdj[match(month,datPropMz$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropMz$seropospropAdjLow[match(month,datPropMz$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropMz$seropospropAdjHigh[match(month,datPropMz$month)])),"%)"),
+    Total=paste(sep="",format(nsmall=1,round(digits=1,100*datProp$seropospropAdj[match(month,datProp$month)])),"% (",format(nsmall=1,round(digits=1,100*datProp$seropospropAdjLow[match(month,datProp$month)])),"%,",format(nsmall=1,round(digits=1,100*datProp$seropospropAdjHigh[match(month,datProp$month)])),"%)")
+  )
+
+write.csv(tab2Paper,row.names=F,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Tab2_AdjustedPrevlaenceEstimates_StratifiedByLocation.csv")))
+```
+
+```{r applyPopWeights}
+# apply sample weights to overall seroprevalence
+datPropAllSampWeight<-dat %>%
+  dplyr::summarise(seroposprop=sum(seropos*sampWeight)/sum(sampWeight),
+            seropospropLow=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[1],
+            seropospropHigh=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[2],.groups="drop")
+
+for(i in 1:nrow(datPropAllSampWeight)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datPropAllSampWeight$seropospropLow[i],datPropAllSampWeight$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datPropAllSampWeight$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  datPropAllSampWeight$seropospropAdj[i]<-tmp$estimate
+  datPropAllSampWeight$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datPropAllSampWeight$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+# apply sample weights to monthly seroprevalence
+datPropMonthSampWeight<-dat %>%
+  group_by(month) %>%
+  dplyr::summarise(seroposprop=sum(seropos*sampWeight)/sum(sampWeight),
+            seropospropLow=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[1],
+            seropospropHigh=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[2],.groups="drop")
+
+datPropMonthSampWeight$seropospropAdj<-NA
+datPropMonthSampWeight$seropospropAdjLow<-NA
+datPropMonthSampWeight$seropospropAdjHigh<-NA
+
+for(i in 1:nrow(datPropMonthSampWeight)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datPropMonthSampWeight$seropospropLow[i],datPropMonthSampWeight$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datPropMonthSampWeight$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  datPropMonthSampWeight$seropospropAdj[i]<-tmp$estimate
+  datPropMonthSampWeight$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datPropMonthSampWeight$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+datPropStratSampWeight<-dat %>%
+  group_by(month,location) %>%
+  dplyr::summarise(seroposprop=sum(seropos*sampWeight)/sum(sampWeight),
+            seropospropLow=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[1],
+            seropospropHigh=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[2],.groups="drop")
+
+datPropStratSampWeight$seropospropAdj<-NA
+datPropStratSampWeight$seropospropAdjLow<-NA
+datPropStratSampWeight$seropospropAdjHigh<-NA
+
+for(i in 1:nrow(datPropStratSampWeight)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datPropStratSampWeight$seropospropLow[i],datPropStratSampWeight$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datPropStratSampWeight$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e6)
+  datPropStratSampWeight$seropospropAdj[i]<-tmp$estimate
+  datPropStratSampWeight$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datPropStratSampWeight$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+sumMonthWeighted<-sumMonth %>%
+  dplyr::filter(location=="All samples") %>%
+  dplyr::select(!location) %>%
+  mutate(
+    seropos_propAdj_Weighted=paste(sep="",format(nsmall=1,round(digits=1,100*datPropMonthSampWeight$seropospropAdj[match(month,datPropMonthSampWeight$month)])),"%")
+  )
+
+sumMonthWeighted %>%
+  dplyr::select(!age_IQR) %>%
+  kable(col.names=c("Month","Samples (freq.)","Age (median)","Females (%)","Seropositives (freq.)","Seropositives, unadj. (%)", "Seropositives, adj, (%)", "Seropositives, weighted & adj. (%)"),
+        caption="Summary statistics for samples (across all sites) per month. The unadjusted, adjusted (for assay sensitivity and specificity) but unweighted and adjusted & weighted (by population weights derived from census data) seropositive percentages are shown.",align = "r") %>%
+  kable_styling(full_width = FALSE)
+
+datPropBl<-datPropStratSampWeight %>% dplyr::filter(location=="Balaka")
+datPropBt<-datPropStratSampWeight %>% dplyr::filter(location=="Blantyre")
+datPropLl<-datPropStratSampWeight %>% dplyr::filter(location=="Lilongwe")
+datPropMz<-datPropStratSampWeight %>% dplyr::filter(location=="Mzuzu")
+
+tab2Paper<-data.frame(
+  month=gsub(seq(ym("2020-01"),ym("2021-07"),by="month"),pattern="-01$",replacement=""),
+  Balaka=NA,
+  Blantyre=NA,
+  Lilongwe=NA,
+  Mzuzu=NA,
+  Total=NA,
+  TotalWeighted=NA
+) %>%
+  mutate(
+    Balaka=paste(sep="",format(nsmall=1,round(digits=1,100*datPropBl$seropospropAdj[match(month,datPropBl$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropBl$seropospropAdjLow[match(month,datPropBl$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropBl$seropospropAdjHigh[match(month,datPropBl$month)])),"%)"),
+    Blantyre=paste(sep="",format(nsmall=1,round(digits=1,100*datPropBt$seropospropAdj[match(month,datPropBt$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropBt$seropospropAdjLow[match(month,datPropBt$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropBt$seropospropAdjHigh[match(month,datPropBt$month)])),"%)"),
+    Lilongwe=paste(sep="",format(nsmall=1,round(digits=1,100*datPropLl$seropospropAdj[match(month,datPropLl$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropLl$seropospropAdjLow[match(month,datPropLl$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropLl$seropospropAdjHigh[match(month,datPropLl$month)])),"%)"),
+    Mzuzu=paste(sep="",format(nsmall=1,round(digits=1,100*datPropMz$seropospropAdj[match(month,datPropMz$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropMz$seropospropAdjLow[match(month,datPropMz$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropMz$seropospropAdjHigh[match(month,datPropMz$month)])),"%)"),
+    Total=paste(sep="",format(nsmall=1,round(digits=1,100*datProp$seropospropAdj[match(month,datProp$month)])),"% (",format(nsmall=1,round(digits=1,100*datProp$seropospropAdjLow[match(month,datProp$month)])),"%,",format(nsmall=1,round(digits=1,100*datProp$seropospropAdjHigh[match(month,datProp$month)])),"%)"),
+    TotalWeighted=paste(sep="",format(nsmall=1,round(digits=1,100*datPropMonthSampWeight$seropospropAdj[match(month,datPropMonthSampWeight$month)])),"% (",format(nsmall=1,round(digits=1,100*datPropMonthSampWeight$seropospropAdjLow[match(month,datPropMonthSampWeight$month)])),"%,",format(nsmall=1,round(digits=1,100*datPropMonthSampWeight$seropospropAdjHigh[match(month,datPropMonthSampWeight$month)])),"%)")
+  )
+
+write.csv(tab2Paper,row.names=F,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Tab2_AdjustedPrevlaenceEstimates_StratifiedByLocation_Weighted.csv")))
+
+# apply sample weights to monthly seroprevalence by location
+datPropLocSampWeight<-dat %>%
+  group_by(location,month) %>%
+  dplyr::summarise(seroposprop=sum(seropos*sampWeight)/sum(sampWeight),
+            seropospropLow=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[1],
+            seropospropHigh=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[2],.groups="drop")
+
+datPropLocSampWeight$seropospropAdj<-NA
+datPropLocSampWeight$seropospropAdjLow<-NA
+datPropLocSampWeight$seropospropAdjHigh<-NA
+
+for(i in 1:nrow(datPropLocSampWeight)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datPropLocSampWeight$seropospropLow[i],datPropLocSampWeight$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datPropLocSampWeight$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  datPropLocSampWeight$seropospropAdj[i]<-tmp$estimate
+  datPropLocSampWeight$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datPropLocSampWeight$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+sumLocWeighted<-sumMonth %>%
+  mutate(
+    seropos_propAdj_Weighted=NA
+  )
+
+for(j in 1:nrow(sumLocWeighted)){
+  if(sumLocWeighted$location[j]!="All samples"){
+    sumLocWeighted$seropos_propAdj_Weighted[j]<-paste(sep="",format(nsmall=1,round(digits=1,100*datPropLocSampWeight$seropospropAdj[datPropLocSampWeight$month==sumLocWeighted$month[j] & datPropLocSampWeight$location==sumLocWeighted$location[j]])),"%")
+  }else{
+    sumLocWeighted$seropos_propAdj_Weighted[j]<-paste(sep="",format(nsmall=1,round(digits=1,100*datPropMonthSampWeight$seropospropAdj[datPropMonthSampWeight$month==sumLocWeighted$month[j]])),"%")
+  }
+}
+```
+
+```{r printSumTab}
+# idxAll<-which(sumMonth$location=="All samples")
+# idxBalaka<-which(sumMonth$location=="Balaka")
+# idxBlantyre<-which(sumMonth$location=="Blantyre")
+# idxLilongwe<-which(sumMonth$location=="Lilongwe")
+# idxMzuzu<-which(sumMonth$location=="Mzuzu")
+# 
+# sumMonth %>%
+#   dplyr::select(!c(location,seropos_prop)) %>%
+#   kable(col.names=c("Month","Number of samples","Age (median)","Age (IQR)","Females (%)","Seropositives (frequency)", "Seropositives, adjusted (%)"),
+#         caption="Summary statistics for samples per site and month. The seropositive percentage has been adjusted for the assay sensitivity and specificity.",align = "r") %>%
+#   kable_styling(full_width = FALSE) %>%
+#   pack_rows("All samples",min(idxAll),max(idxAll)) %>%
+#   pack_rows("Balaka",min(idxBalaka),max(idxBalaka)) %>%
+#   pack_rows("Blantyre",min(idxBlantyre),max(idxBlantyre)) %>%
+#   pack_rows("Lilongwe",min(idxLilongwe),max(idxLilongwe)) %>%
+#   pack_rows("Mzuzu",min(idxMzuzu),max(idxMzuzu))
+
+idxAll<-which(sumLocWeighted$location=="All samples")
+idxBalaka<-which(sumLocWeighted$location=="Balaka")
+idxBlantyre<-which(sumLocWeighted$location=="Blantyre")
+idxLilongwe<-which(sumLocWeighted$location=="Lilongwe")
+idxMzuzu<-which(sumLocWeighted$location=="Mzuzu")
+
+sumLocWeighted %>%
+  dplyr::select(!c(location,seropos_prop,seropos_propAdj)) %>%
+  kable(col.names=c("Month","Number of samples","Age (median)","Age (IQR)","Females (%)","Seropositives (frequency)", "Seropositives, adjusted, weighted (%)"),
+        caption="Summary statistics for samples per site and month. The seropositive percentage has been adjusted for the assay sensitivity and specificity and population weights.",align = "r") %>%
+  kable_styling(full_width = FALSE) %>%
+  pack_rows("All samples",min(idxAll),max(idxAll)) %>%
+  pack_rows("Balaka",min(idxBalaka),max(idxBalaka)) %>%
+  pack_rows("Blantyre",min(idxBlantyre),max(idxBlantyre)) %>%
+  pack_rows("Lilongwe",min(idxLilongwe),max(idxLilongwe)) %>%
+  pack_rows("Mzuzu",min(idxMzuzu),max(idxMzuzu))
+
+#dat %>% 
+#  dplyr::select(month,location,age,ODCutoff,results) %>% 
+#  tbl_summary()
+```
+
+Crude seroprevalence was `r round(digits=1,100*datPropAll$seroposprop)`% (95% CI [`r format(nsmall=1,round(digits=1,100*datPropAll$seropospropLow))`%,`r round(digits=1,100*datPropAll$seropospropHigh)`%]). After adjustment for assay sensitivity and specificity this was `r round(digits=1,100*datPropAll$seropospropAdj)`% [`r round(digits=1,100*datPropAll$seropospropAdjLow)`%,`r round(digits=1,100*datPropAll$seropospropAdjHigh)`%]. After both weighting and adjustment for assay sensitivity and specificity this was `r round(digits=1,100*datPropAllSampWeight$seropospropAdj)`% [`r round(digits=1,100*datPropAllSampWeight$seropospropAdjLow)`%,`r round(digits=1,100*datPropAllSampWeight$seropospropAdjHigh)`%].
+
+```{r plots, fig.width=12,fig.height=6.75,results=FALSE,eval=F}
+## Exploratory plots
+g<-dat %>%
+  ggplot(mapping=aes(x=date,y=ifelse(results=="pos",1,0))) +
+  geom_point(alpha=0.5,col="grey") +
+  #geom_smooth(col="darkgrey") +
+  geom_point(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj),col="orange",size=3,data=datProp) +
+  geom_point(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seroposprop),col="steelblue",size=3,data=datProp) +
+  geom_line(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj),col="orange",lwd=1,data=datProp) +
+  geom_line(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seroposprop),col="steelblue",lwd=1,data=datProp) +
+  geom_ribbon(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj,ymin=seropospropAdjLow,ymax=seropospropAdjHigh),fill="orange",col=NA,alpha=0.2,data=datProp) +
+  geom_ribbon(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seroposprop,ymin=seropospropLow,ymax=seropospropHigh),fill="steelblue",col=NA,alpha=0.2,data=datProp) +
+  theme_light() +
+  ylab("Seropositive proportion") +
+  xlab("") +
+  labs(title="Seroprevalence over time",caption="Orange dots are estimated seroprevalences at each time point and adjusted for assay sensitivity and specificity.\nThe orange lines interpolate between those estimates.\nBlue dots and lines are for unadjusted seroprevalence estimates. \nGrey dots show the individual-level data, which are either positive (1) or not (0).")
+
+gStrat<-dat %>%
+  ggplot(mapping=aes(x=date,y=ifelse(results=="pos",1,0))) +
+  geom_point(alpha=0.5,col="grey") +
+  geom_point(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj),col="orange",size=3,data=datPropStrat) +
+  geom_point(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seroposprop),col="steelblue",size=3,data=datPropStrat) +
+  geom_line(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj),col="orange",lwd=1,data=datPropStrat) +
+  geom_line(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seroposprop),col="steelblue",lwd=1,data=datPropStrat) +
+  geom_ribbon(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj,ymin=seropospropAdjLow,ymax=seropospropAdjHigh),fill="orange",col=NA,alpha=0.2,data=datPropStrat) +
+  geom_ribbon(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seroposprop,ymin=seropospropLow,ymax=seropospropHigh),fill="steelblue",col=NA,alpha=0.2,data=datPropStrat) +
+  ylab("Seropositive proportion") +
+  facet_wrap(~location) +
+  theme_light() +
+  ylab("Seropositive proportion") +
+  xlab("") +
+  labs(title="Seroprevalence over time and by region",caption="Orange dots are estimated seroprevalences at each time point and adjusted for assay sensitivity and specificity.\nThe orange lines interpolate between those estimates.\nBlue dots and lines are for unadjusted seroprevalence estimates. \nGrey dots show the individual-level data, which are either positive (1) or not (0).")
+
+print(g)
+print(gStrat)
+
+png(width=12,height=6.75,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig0_ExploratoryPlot_AllSamples.png")))
+print(g)
+dev.off()
+
+png(width=12,height=8,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig0_ExploratoryPlot_StratifiedByLocation.png")))
+print(gStrat)
+dev.off()
+```
+
+## Optical densities (OD) and interpretation of the serology assay results
+
+```{r boxJitterPlot}
+g<-dat %>%
+  ggplot(mapping=aes(x=results,y=ODCutoff,col=results)) +
+  geom_boxplot() +
+  geom_jitter(alpha=0.3,width=0.25,size=2) +
+  scale_color_manual(values=c("steelblue","orange","salmon")) +
+  guides(colour="none") +
+  theme_bw() +
+  xlab("Seropositivity status") +
+  ylab("OD / cut-off ratio (titre)") +
+  theme(axis.text.x = element_text(angle = 30, vjust = 0.5)) +
+  labs(title="Box & jitter plot for SARS-COV2 titres (OD) by seropositivity status.") #+
+  #geom_hline(mapping=aes(yintercept=1.1))
+
+print(g)
+
+png(width=12,height=6.75,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig1_BoxJitterPlot_ODvsInterpretation.png")))
+print(g)
+dev.off()
+```
+
+```{r whoTable}
+datWHO<-list()
+
+for(m in gsub("all",seq(ym("2020-01"),ym("2021-07"),by="month"),pattern="-01$",replacement="")){
+  datWHO[[m]]<-data.frame(
+    subGroup=c("All","Males","Females","15-19","20-29","30-39","40-49","50-59","60-64"),
+    sampSize=NA,
+    nSeroPos=NA,
+    nSeroPosWithSymp=NA,
+    comments=c(rep("Age range in MBTS data limited to 15-63",3),rep(NA,5),"Age range in MBTS data limited to 15-63"),
+    propSeroPos=NA,
+    propSeroPos95CILow=NA,
+    propSeroPos95CIHigh=NA,
+    propSeroPosWithSymp=NA,
+    propSeroPosAdjSensSpec=NA,
+    propSeroPosAdjSensSpec95CILow=NA,
+    propSeroPosAdjSensSpec95CIHigh=NA,
+    propSeroPosWeighted=NA,
+    propSeroPosWeighted95CILow=NA,
+    propSeroPosWeighted95CIHigh=NA,
+    propSeroPosWeightedAdjSensSpec=NA,
+    propSeroPosWeightedAdjSensSpec95CILow=NA,
+    propSeroPosWeightedAdjSensSpec95CIHigh=NA
+  )
+  
+  rownames(datWHO[[m]])<-datWHO[[m]]$subGroup
+  
+  if(m=="all"){
+    datTmp<-dat
+  }else{
+    datTmp<-dat %>%
+      dplyr::filter(month==m)
+  }
+  
+  # populate counts and proportions
+  datWHO[[m]]["All",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(nrow(datTmp),sum(datTmp$seropos),sum(datTmp$seropos)/nrow(datTmp),sum(datTmp$seropos*datTmp$sampWeight)/sum(datTmp$sampWeight))
+  datWHO[[m]]["Males",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$gender=="Male"),sum(datTmp$seropos[datTmp$gender=="Male"]),sum(datTmp$seropos[datTmp$gender=="Male"])/sum(datTmp$gender=="Male"),sum(datTmp$seropos[datTmp$gender=="Male"]*datTmp$sampWeight[datTmp$gender=="Male"])/sum(datTmp$sampWeight[datTmp$gender=="Male"]))
+  datWHO[[m]]["Females",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$gender=="Female"),sum(datTmp$seropos[datTmp$gender=="Female"]),sum(datTmp$seropos[datTmp$gender=="Female"])/sum(datTmp$gender=="Female"),sum(datTmp$seropos[datTmp$gender=="Female"]*datTmp$sampWeight[datTmp$gender=="Female"])/sum(datTmp$sampWeight[datTmp$gender=="Female"]))
+  datWHO[[m]]["15-19",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$age_years>=15 & datTmp$age_years<=19),sum(datTmp$seropos[datTmp$age_years>=15 & datTmp$age_years<=19]),sum(datTmp$seropos[datTmp$age_years>=15 & datTmp$age_years<=19])/sum(datTmp$age_years>=15 & datTmp$age_years<=19),sum(datTmp$seropos[datTmp$age_years>=15 & datTmp$age_years<=19]*datTmp$sampWeight[datTmp$age_years>=15 & datTmp$age_years<=19])/sum(datTmp$sampWeight[datTmp$age_years>=15 & datTmp$age_years<=19]))
+  datWHO[[m]]["20-29",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$age_years>=20 & datTmp$age_years<=29),sum(datTmp$seropos[datTmp$age_years>=20 & datTmp$age_years<=29]),sum(datTmp$seropos[datTmp$age_years>=20 & datTmp$age_years<=29])/sum(datTmp$age_years>=20 & datTmp$age_years<=29),sum(datTmp$seropos[datTmp$age_years>=20 & datTmp$age_years<=29]*datTmp$sampWeight[datTmp$age_years>=20 & datTmp$age_years<=29])/sum(datTmp$sampWeight[datTmp$age_years>=20 & datTmp$age_years<=29]))
+  datWHO[[m]]["30-39",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$age_years>=30 & datTmp$age_years<=39),sum(datTmp$seropos[datTmp$age_years>=30 & datTmp$age_years<=39]),sum(datTmp$seropos[datTmp$age_years>=30 & datTmp$age_years<=39])/sum(datTmp$age_years>=30 & datTmp$age_years<=39),sum(datTmp$seropos[datTmp$age_years>=30 & datTmp$age_years<=39]*datTmp$sampWeight[datTmp$age_years>=30 & datTmp$age_years<=39])/sum(datTmp$sampWeight[datTmp$age_years>=30 & datTmp$age_years<=39]))
+  datWHO[[m]]["40-49",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$age_years>=40 & datTmp$age_years<=49),sum(datTmp$seropos[datTmp$age_years>=40 & datTmp$age_years<=49]),sum(datTmp$seropos[datTmp$age_years>=40 & datTmp$age_years<=49])/sum(datTmp$age_years>=40 & datTmp$age_years<=49),sum(datTmp$seropos[datTmp$age_years>=40 & datTmp$age_years<=49]*datTmp$sampWeight[datTmp$age_years>=40 & datTmp$age_years<=49])/sum(datTmp$sampWeight[datTmp$age_years>=40 & datTmp$age_years<=49]))
+  datWHO[[m]]["50-59",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$age_years>=50 & datTmp$age_years<=59),sum(datTmp$seropos[datTmp$age_years>=50 & datTmp$age_years<=59]),sum(datTmp$seropos[datTmp$age_years>=50 & datTmp$age_years<=59])/sum(datTmp$age_years>=50 & datTmp$age_years<=59),sum(datTmp$seropos[datTmp$age_years>=50 & datTmp$age_years<=59]*datTmp$sampWeight[datTmp$age_years>=50 & datTmp$age_years<=59])/sum(datTmp$sampWeight[datTmp$age_years>=50 & datTmp$age_years<=59]))
+  datWHO[[m]]["60-64",c("sampSize","nSeroPos","propSeroPos","propSeroPosWeighted")]<-c(sum(datTmp$age_years>=60 & datTmp$age_years<=64),sum(datTmp$seropos[datTmp$age_years>=60 & datTmp$age_years<=64]),sum(datTmp$seropos[datTmp$age_years>=60 & datTmp$age_years<=64])/sum(datTmp$age_years>=60 & datTmp$age_years<=64),sum(datTmp$seropos[datTmp$age_years>=60 & datTmp$age_years<=64]*datTmp$sampWeight[datTmp$age_years>=60 & datTmp$age_years<=64])/sum(datTmp$sampWeight[datTmp$age_years>=60 & datTmp$age_years<=64]))
+  
+  # populate confidence intervals
+  for(j in 1:nrow(datWHO[[m]])){
+    if(!is.na(datWHO[[m]][j,"sampSize"]) & datWHO[[m]][j,"sampSize"]>0){
+      datWHO[[m]][j,c("propSeroPos95CILow","propSeroPos95CIHigh")]<-binom.test(n=datWHO[[m]][j,"sampSize"],x=datWHO[[m]][j,"nSeroPos"])$conf.int
+    }
+  }
+  
+  # populate weighted confidence intervals
+  if(!is.na(datWHO[[m]]["All","sampSize"]) & datWHO[[m]]["All","sampSize"]>0){datWHO[[m]]["All",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp),x=round(sum(datTmp$seropos*datTmp$sampWeight)*(nrow(datTmp)/sum(datTmp$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% dplyr::filter(gender=="Male")
+  if(!is.na(datWHO[[m]]["Males","sampSize"]) & datWHO[[m]]["Males","sampSize"]>0){datWHO[[m]]["Males",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% filter(gender=="Female")
+  if(!is.na(datWHO[[m]]["Females","sampSize"]) & datWHO[[m]]["Females","sampSize"]>0){datWHO[[m]]["Females",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% dplyr::filter(age_years>=15 & age_years<=19)
+  if(!is.na(datWHO[[m]]["15-19","sampSize"]) & datWHO[[m]]["15-19","sampSize"]>0){datWHO[[m]]["15-19",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% dplyr::filter(age_years>=20 & age_years<=29)
+  if(!is.na(datWHO[[m]]["20-29","sampSize"]) & datWHO[[m]]["20-29","sampSize"]>0){datWHO[[m]]["20-29",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% dplyr::filter(age_years>=30 & age_years<=39)
+  if(!is.na(datWHO[[m]]["30-39","sampSize"]) & datWHO[[m]]["30-39","sampSize"]>0){datWHO[[m]]["30-39",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% dplyr::filter(age_years>=40 & age_years<=49)
+  if(!is.na(datWHO[[m]]["40-49","sampSize"]) & datWHO[[m]]["40-49","sampSize"]>0){datWHO[[m]]["40-49",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% dplyr::filter(age_years>=50 & age_years<=59)
+  if(!is.na(datWHO[[m]]["50-59","sampSize"]) & datWHO[[m]]["50-59","sampSize"]>0){datWHO[[m]]["50-59",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  datTmp2<-datTmp %>% dplyr::filter(age_years>=60 & age_years<=64)
+  if(!is.na(datWHO[[m]]["60-64","sampSize"]) & datWHO[[m]]["60-64","sampSize"]>0){datWHO[[m]]["60-64",c("propSeroPosWeighted95CILow","propSeroPosWeighted95CIHigh")]<-binom.test(n=nrow(datTmp2),x=round(sum(datTmp2$seropos*datTmp2$sampWeight)*(nrow(datTmp2)/sum(datTmp2$sampWeight))))$conf.int}
+  
+  
+  # adjust for assay sensitivity and specificty
+  for(j in 1:nrow(datWHO[[m]])){
+    if(!is.na(datWHO[[m]]$sampSize[j]) & datWHO[[m]]$sampSize[j]>0){
+      tmp<-adjPrevSensSpecCI(prevCI=c(datWHO[[m]]$propSeroPos95CILow[j],datWHO[[m]]$propSeroPos95CIHigh[j]),
+                             sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                             specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                             prev=datWHO[[m]]$propSeroPos[j],
+                             sens=assaySensInd[1]/assaySensInd[2],
+                             spec=assaySpecInd[1]/assaySpecInd[2],
+                             N=1e5)
+      datWHO[[m]]$propSeroPosAdjSensSpec[j]<-tmp$estimate
+      datWHO[[m]]$propSeroPosAdjSensSpec95CILow[j]<-tmp$conf.int[1]
+      datWHO[[m]]$propSeroPosAdjSensSpec95CIHigh[j]<-tmp$conf.int[2]
+      
+      tmp<-adjPrevSensSpecCI(prevCI=c(datWHO[[m]]$propSeroPosWeighted95CILow[j],datWHO[[m]]$propSeroPosWeighted95CIHigh[j]),
+                             sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                             specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                             prev=datWHO[[m]]$propSeroPosWeighted[j],
+                             sens=assaySensInd[1]/assaySensInd[2],
+                             spec=assaySpecInd[1]/assaySpecInd[2],
+                             N=1e5)
+      datWHO[[m]]$propSeroPosWeightedAdjSensSpec[j]<-tmp$estimate
+      datWHO[[m]]$propSeroPosWeightedAdjSensSpec95CILow[j]<-tmp$conf.int[1]
+      datWHO[[m]]$propSeroPosWeightedAdjSensSpec95CIHigh[j]<-tmp$conf.int[2]
+    }
+  }
+  
+  write.csv(datWHO[[m]],file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),paste(sep="","tableWHO_",m,".csv"))),row.names=F,quote=F)
+}
+```
+
+## Flexible seroprevalence models
+
+These will allow to include other covariates to explore associations and the model fits provide a smoothed estimate of the seroprevalence over time. We use Genersalised Additive Models (GAMs) with reduced rank, panlised thin plate splines to obtain the model fits.
+
+```{r modelSmooth}
+dat$dateNum<-as.numeric(ymd(dat$date))
+
+#modRcs<-glm(seropos~rcs(dateNum,7),data=dat,family="binomial")
+modGam<-gam(seropos~s(dateNum,bs="tp"),data=dat,family="binomial")
+modGamWeighted<-gam(seropos~s(dateNum,bs="tp"),data=dat,family="binomial",weights=sampWeight)
+linkFunInv<-family(modGam)$linkinv
+
+predDat<-data.frame(
+  dateNum=min(dat$dateNum):max(dat$dateNum),
+  date=seq(min(dat$date),max(dat$date),by=1)
+)
+predDatWeighted<-predDat
+
+#predObjRcs<-predict(modRcs,newdata=predDat,type="link",se.fit=TRUE)
+predObjGam<-predict(modGam,newdata=predDat,type="link",se.fit=TRUE)
+predObjGamWeighted<-predict(modGamWeighted,newdata=predDat,type="link",se.fit=TRUE)
+
+predDat<-cbind(
+  predDat,
+  #predObjRcs$fit,
+  #predObjRcs$se.fit,
+  predObjGam$fit,
+  predObjGam$se.fit
+)
+
+predDatWeighted<-cbind(
+  predDatWeighted,
+  #predObjRcs$fit,
+  #predObjRcs$se.fit,
+  predObjGamWeighted$fit,
+  predObjGamWeighted$se.fit
+)
+
+#colnames(predDat)<-c("dateNum","date","fit.rcs","se.fit.rcs","fit.gam","se.fit.gam")
+colnames(predDat)<-c("dateNum","date","fit.gam","se.fit.gam")
+colnames(predDatWeighted)<-c("dateNum","date","fit.gam","se.fit.gam")
+predDat <- predDat %>%
+  mutate(
+    #seroprevRcs=linkFunInv(fit.rcs),
+    #seroprevRcsLow=linkFunInv(fit.rcs-qnorm(0.975)*se.fit.rcs),
+    #seroprevRcsUpp=linkFunInv(fit.rcs+qnorm(0.975)*se.fit.rcs),
+    seroprevGam=linkFunInv(fit.gam),
+    seroprevGamLow=linkFunInv(fit.gam-qnorm(0.975)*se.fit.gam),
+    seroprevGamUpp=linkFunInv(fit.gam+qnorm(0.975)*se.fit.gam)
+  )
+predDatWeighted <- predDatWeighted %>%
+  mutate(
+    #seroprevRcs=linkFunInv(fit.rcs),
+    #seroprevRcsLow=linkFunInv(fit.rcs-qnorm(0.975)*se.fit.rcs),
+    #seroprevRcsUpp=linkFunInv(fit.rcs+qnorm(0.975)*se.fit.rcs),
+    seroprevGam=linkFunInv(fit.gam),
+    seroprevGamLow=linkFunInv(fit.gam-qnorm(0.975)*se.fit.gam),
+    seroprevGamUpp=linkFunInv(fit.gam+qnorm(0.975)*se.fit.gam)
+  )
+
+predDat$seroprevGamAdj<-NA
+predDat$seroprevGamAdjLow<-NA
+predDat$seroprevGamAdjUpp<-NA
+predDatWeighted$seroprevGamAdj<-NA
+predDatWeighted$seroprevGamAdjLow<-NA
+predDatWeighted$seroprevGamAdjUpp<-NA
+
+for(i in 1:nrow(predDat)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(predDat$seroprevGamLow[i],predDat$seroprevGamUpp[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=predDat$seroprevGam[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  predDat$seroprevGamAdj[i]<-tmp$estimate
+  predDat$seroprevGamAdjLow[i]<-tmp$conf.int[1]
+  predDat$seroprevGamAdjUpp[i]<-tmp$conf.int[2]
+  
+  tmp<-adjPrevSensSpecCI(prevCI=c(predDatWeighted$seroprevGamLow[i],predDatWeighted$seroprevGamUpp[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=predDatWeighted$seroprevGam[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  predDatWeighted$seroprevGamAdj[i]<-tmp$estimate
+  predDatWeighted$seroprevGamAdjLow[i]<-tmp$conf.int[1]
+  predDatWeighted$seroprevGamAdjUpp[i]<-tmp$conf.int[2]
+}
+
+# predDat$seroprevGamAdjLow[predDat$seroprevGamAdjLow<=0 | predDat$seroprevGamAdj<=0]<-0
+# predDat$seroprevGamAdj[predDat$seroprevGamAdj<=0]<-0
+
+g<-dat %>%
+  ggplot(mapping=aes(x=date,y=seropos)) +
+  geom_point(alpha=0.5,col="grey",size=2) +
+  geom_line(col="orange",mapping=aes(x=date,y=seroprevGamAdj),data=predDat,lwd=2) +
+  geom_ribbon(col=NA,fill="orange",alpha=0.5,mapping=aes(x=date,y=seroprevGamAdj,ymin=seroprevGamAdjLow,ymax=seroprevGamAdjUpp),data=predDatWeighted,lwd=2) +
+  geom_point(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj),col="black",size=3,data=datPropMonthSampWeight) +
+  geom_errorbar(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj,ymin=seropospropAdjLow,ymax=seropospropAdjHigh),col="black",width=4,alpha=0.75,data=datPropMonthSampWeight) +
+  theme_light() +
+  ylab("Seropositive proportion") +
+  xlab("") +
+  labs(title="Seroprevalence over time (no population weights).",caption="Black dots are estimated seroprevalences at each time point and adjusted for assay sensitivity and specificity, together with 95% confidence intervals.\nThe orange line is a smooth generalised additive model fit to the data.\nGrey dots show the individual-level data, which are either positive (1) or not (0).")
+
+print(g)
+
+png(width=12,height=6.75,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig1a_GAMFit_AllSamples.png")))
+print(g)
+dev.off()
+
+gW<-dat %>%
+  ggplot(mapping=aes(x=date,y=seropos)) +
+  geom_point(alpha=0.5,col="grey",size=2) +
+  geom_line(col="orange",mapping=aes(x=date,y=seroprevGamAdj),data=predDatWeighted,lwd=2) +
+  geom_ribbon(col=NA,fill="orange",alpha=0.5,mapping=aes(x=date,y=seroprevGamAdj,ymin=seroprevGamAdjLow,ymax=seroprevGamAdjUpp),data=predDatWeighted,lwd=2) +
+  geom_point(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj),col="black",size=3,data=datPropMonthSampWeight) +
+  geom_errorbar(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj,ymin=seropospropAdjLow,ymax=seropospropAdjHigh),col="black",width=4,alpha=0.75,data=datPropMonthSampWeight) +
+  theme_light() +
+  ylab("Seropositive proportion") +
+  xlab("") +
+  labs(title="Seroprevalence over time (using population weights).",caption="Data are weighted according to population weights calculated from NSO census projection data.\nBlack dots are population-weighted, estimated seroprevalences at each time point and adjusted for assay sensitivity and specificity, together with 95% confidence intervals.\nThe orange line is a smooth generalised additive model fit to the data.\nGrey dots show the individual-level data, which are either positive (1) or not (0).")
+
+print(gW)
+
+png(width=12,height=6.75,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig1a_GAMFit_AllSamples_WithSampleWeights.png")))
+print(gW)
+dev.off()
+```
+
+```{r modelSmoothStrat}
+predDatStratList<-list()
+
+for(pl in unique(dat$location)){
+  predDatTmp<-data.frame(
+    location=rep(pl,length(min(dat$dateNum):max(dat$dateNum))),
+    dateNum=min(dat$dateNum):max(dat$dateNum),
+    date=seq(min(dat$date),max(dat$date),by=1)
+  )
+  
+  modGamWeighted<-gam(seropos~s(dateNum,bs="tp"),data=dat %>% dplyr::filter(location==pl),family="binomial",weights = sampWeight)
+  linkFunInv<-family(modGamWeighted)$linkinv
+
+  predObjGamWeighted<-predict(modGamWeighted,newdata=predDatTmp,type="link",se.fit=TRUE)
+  
+  predDatTmp<-cbind(
+    predDatTmp,
+    predObjGamWeighted$fit,
+    predObjGamWeighted$se.fit
+  )
+  
+  B<-10000 # 1000 bootstrap samples
+  set.seed(123) # for reproducibility
+  predDatTmp2<-predDatTmp[,1:3]
+  for(b in 1:B){
+    modGamWeightedBoot<-gam(seropos~s(dateNum,bs="tp"),data=dat[sample(1:nrow(dat),size=nrow(dat),replace=T),] %>% dplyr::filter(location==pl),family="binomial",weights = sampWeight)
+    predObjGamWeightedBoot<-predict(modGamWeightedBoot,newdata=predDatTmp,type="link",se.fit=FALSE)
+    predDatTmp2<-cbind(predDatTmp2,predObjGamWeightedBoot)
+  }
+  
+  colnames(predDatTmp)<-c("location","dateNum","date","fit.gam","se.fit.gam")
+  predDatTmp <- predDatTmp %>%
+    mutate(
+      seroprevGam=linkFunInv(fit.gam),
+      #seroprevGamLow=linkFunInv(fit.gam-qnorm(0.975)*se.fit.gam),
+      #seroprevGamUpp=linkFunInv(fit.gam+qnorm(0.975)*se.fit.gam)
+      seroprevGamLow=NA,
+      seroprevGamUpp=NA,
+    )
+  
+  for(j in 1:nrow(predDatTmp)){
+    tmp<-HDInterval::hdi(as.numeric(predDatTmp2[j,-(1:3)]))
+    predDatTmp$seroprevGamLow[j]<-linkFunInv(tmp[1])
+    predDatTmp$seroprevGamUpp[j]<-linkFunInv(tmp[2])
+  }
+  rm(predDatTmp2)
+  
+  predDatTmp$seroprevGamAdj<-NA
+  predDatTmp$seroprevGamAdjLow<-NA
+  predDatTmp$seroprevGamAdjUpp<-NA
+  
+  for(i in 1:nrow(predDatTmp)){
+    tmp<-adjPrevSensSpecCI(prevCI=c(predDatTmp$seroprevGamLow[i],predDatTmp$seroprevGamUpp[i]),
+                           sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                           specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                           prev=predDatTmp$seroprevGam[i],
+                           sens=assaySensInd[1]/assaySensInd[2],
+                           spec=assaySpecInd[1]/assaySpecInd[2],
+                           N=1e5)
+    predDatTmp$seroprevGamAdj[i]<-tmp$estimate
+    predDatTmp$seroprevGamAdjLow[i]<-tmp$conf.int[1]
+    predDatTmp$seroprevGamAdjUpp[i]<-tmp$conf.int[2]
+  }
+  
+  predDatTmp$seroprevGamAdjLow[predDatTmp$seroprevGamAdjLow<=0 | predDatTmp$seroprevGamAdj<=0]<-0
+  predDatTmp$seroprevGamAdj[predDatTmp$seroprevGamAdj<=0]<-0
+  
+  predDatStratList[[pl]]<-predDatTmp
+  rm(predDatTmp)
+}
+
+predDatStrat<-predDatStratList[[1]]
+for(j in 2:length(predDatStratList)){
+  predDatStrat<-rbind(predDatStrat,predDatStratList[[j]])
+}
+rm(predDatStratList)
+
+gStrat<-dat %>%
+  ggplot(mapping=aes(x=date,y=seropos)) +
+  geom_point(alpha=0.5,col="grey",size=2) +
+  geom_line(col="orange",mapping=aes(x=date,y=seroprevGamAdj),data=predDatStrat,lwd=2) +
+  geom_ribbon(col=NA,fill="orange",alpha=0.5,mapping=aes(x=date,y=seroprevGamAdj,ymin=seroprevGamAdjLow,ymax=seroprevGamAdjUpp),data=predDatStrat,lwd=2) +
+  geom_point(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj),col="black",size=3,data=datPropStratSampWeight) +
+  geom_errorbar(mapping=aes(x=ymd(paste(sep="-",month,"15")),y=seropospropAdj,ymin=seropospropAdjLow,ymax=seropospropAdjHigh),col="black",width=4,alpha=0.75,data=datPropStratSampWeight) +
+  theme_light() +
+  ylab("Seropositive proportion") +
+  xlab("") +
+  facet_wrap(~location) +
+  labs(title="Seroprevalence over time (using population weights).",caption="Black dots are population-weighted, estimated seroprevalences at each time point and adjusted for assay sensitivity and specificity, together with 95% confidence intervals.\nThe orange line is a smooth generalised additive model fit to the data.\nGrey dots show the individual-level data, which are either positive (1) or not (0).")
+
+print(gStrat)
+
+png(width=12,height=6.75,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig2b_GAMFit_StratifiedByLocation.png")))
+print(gStrat)
+dev.off()
+```
+
+A GAM model with covariates:
+
+```{r gamCovs}
+modGam<-gam(seropos~s(dateNum,bs="tp")+gender+location+s(age,bs="tp"),data=dat,family="binomial",weights = sampWeight)
+summary(modGam)
+```
+
+And a more traditional logistic regression model, but using B-splines for time and using age groups rather than exact age - very similar results.
+
+```{r glmCovs}
+dat<-dat %>%
+  mutate(
+    ageGrp=case_when(
+      age<20~"16-19",
+      age>=20 & age<30~"20-29",
+      age>=30 & age<40~"30-39",
+      age>=40 & age<50~"40-49",
+      age>=50~"50+"
+    )
+  )
+
+mod<-glm(seropos~gender+ageGrp+location+bs(ymd(date)),data=dat,family="binomial",weights = sampWeight)
+
+
+tt<-summary(mod)$coefficients
+rownames(tt)<-c("(Intercept)","Male sex","20-29 years","30-39 years","40-49 years","50+ years","Blantyre","Lilongwe","Mzuzu","B-spline coefficient 1, time","B-spline coefficient 2, time","B-spline coefficient 3, time")
+
+tt %>%
+  as.data.frame() %>%
+  #mutate(rownum=1:nrow(tt)) %>%
+  #mutate(`Pr(>|z|)`=ifelse(rownum>1 & `Pr(>|z|)`<0.05,cell_spec(format(nsmall=4,round(digits=4,`Pr(>|z|)`)),bold=T),cell_spec(format(nsmall=4,round(digits=4,`Pr(>|z|)`)),bold=F))) %>%
+  #dplyr::select(!c(rownum)) %>%
+  kable(caption="Results from a multivariable logistic regression model using B-splines to account for the effect of time. Observations have been weighted using population weights.",digits=2) %>%
+  column_spec(5,bold=ifelse(1:nrow(tt)>1 & tt[,"Pr(>|z|)"]<0.05,TRUE,FALSE)) %>%
+  kable_styling(full_width=F)
+```
+
+## Map bubble plots
+
+Seroprevalence bubble plot for estimated, population-weighted seroprevalence by location and at specific timepoints.
+
+```{r mapBubblePlot1, warning=F, message=F, error=F, results=F}
+malawi<-readRDS(malawiDatFile)
+#malawi_utm<-spTransform(malawi, CRS("+proj=utm"))
+malawiDf<-fortify(malawi)
+
+lakes<-read_sf("../../GIS/ne_50m_lakes/ne_50m_lakes.shp")
+lakesMw<-lakes %>% dplyr::filter(grepl(pattern="Malawi",name))
+
+theme_opts<-list(theme(panel.grid.minor = element_blank(),
+                       panel.grid.major = element_blank(),
+                       panel.background = element_blank(),
+                       plot.background = element_blank(),
+                       axis.line = element_blank(),
+                       axis.text.x = element_blank(),
+                       axis.text.y = element_blank(),
+                       axis.ticks = element_blank(),
+                       axis.title.x = element_blank(),
+                       axis.title.y = element_blank()
+                       #plot.title = element_blank())
+))
+
+cities<-data.frame(
+  name=c("Balaka","Blantyre","Lilongwe","Mzuzu"),
+  lon=c(34.9562,35.0168,33.7741,34.0084),
+  lat=c(-14.9876,-15.7667,-13.9626,-11.4390),
+  seroprev=NA
+)
+
+tmp<-datPropStratSampWeight %>%
+  dplyr::filter(month=="2020-04") %>%
+  dplyr::select(location,seropospropAdj)
+
+cities$seroprev<-tmp$seropospropAdj[match(cities$name,tmp$location)]
+
+gApr20<-ggplot() + 
+  geom_polygon(data=malawiDf, aes(long,lat,group=group), fill="whitesmoke")+
+  geom_path(data=malawiDf, aes(long,lat, group=group), color="grey",size=0.1) +
+  geom_sf(data = lakesMw, size=0.25, color=NA,fill="lightblue") +
+  geom_circle(mapping=aes(x0=lon,y0=lat,r=1.25*seroprev),alpha=0.5,col=NA,fill="orange",data=cities) +
+  geom_text(mapping=aes(x=lon,y=lat,label=name),data=cities) +
+  guides() +
+  coord_sf() +
+  theme_opts +
+  ggtitle("April 2020.")
+
+tmp<-datPropStratSampWeight %>%
+  dplyr::filter(month=="2020-07") %>%
+  dplyr::select(location,seropospropAdj)
+
+cities$seroprev<-tmp$seropospropAdj[match(cities$name,tmp$location)]
+
+gJul20<-ggplot() + 
+  geom_polygon(data=malawiDf, aes(long,lat,group=group), fill="whitesmoke")+
+  geom_path(data=malawiDf, aes(long,lat, group=group), color="grey",size=0.1) +
+  geom_sf(data = lakesMw, size=0.25, color=NA,fill="lightblue") +
+  geom_circle(mapping=aes(x0=lon,y0=lat,r=1.25*seroprev),alpha=0.5,col=NA,fill="orange",data=cities) +
+  geom_text(mapping=aes(x=lon,y=lat,label=name),data=cities) +
+  guides() +
+  coord_sf() +
+  theme_opts +
+  ggtitle("July 2020.")
+
+tmp<-datPropStratSampWeight %>%
+  dplyr::filter(month=="2020-10") %>%
+  dplyr::select(location,seropospropAdj)
+
+cities$seroprev<-tmp$seropospropAdj[match(cities$name,tmp$location)]
+
+gOct20<-ggplot() + 
+  geom_polygon(data=malawiDf, aes(long,lat,group=group), fill="whitesmoke")+
+  geom_path(data=malawiDf, aes(long,lat, group=group), color="grey",size=0.1) +
+  geom_sf(data = lakesMw, size=0.25, color=NA,fill="lightblue") +
+  geom_circle(mapping=aes(x0=lon,y0=lat,r=1.25*seroprev),alpha=0.5,col=NA,fill="orange",data=cities) +
+  geom_text(mapping=aes(x=lon,y=lat,label=name),data=cities) +
+  guides() +
+  coord_sf() +
+  theme_opts +
+  ggtitle("October 2020.")
+
+tmp<-datPropStratSampWeight %>%
+  dplyr::filter(month=="2021-01") %>%
+  dplyr::select(location,seropospropAdj)
+
+cities$seroprev<-tmp$seropospropAdj[match(cities$name,tmp$location)]
+
+gJan21<-ggplot() + 
+  geom_polygon(data=malawiDf, aes(long,lat,group=group), fill="whitesmoke")+
+  geom_path(data=malawiDf, aes(long,lat, group=group), color="grey",size=0.1) +
+  geom_sf(data = lakesMw, size=0.25, color=NA,fill="lightblue") +
+  geom_circle(mapping=aes(x0=lon,y0=lat,r=1.25*seroprev),alpha=0.5,col=NA,fill="orange",data=cities) +
+  geom_text(mapping=aes(x=lon,y=lat,label=name),data=cities) +
+  guides() +
+  coord_sf() +
+  theme_opts +
+  ggtitle("January 2021.")
+
+tmp<-datPropStratSampWeight %>%
+  dplyr::filter(month=="2021-04") %>%
+  dplyr::select(location,seropospropAdj)
+
+cities$seroprev<-tmp$seropospropAdj[match(cities$name,tmp$location)]
+
+gApr21<-ggplot() + 
+  geom_polygon(data=malawiDf, aes(long,lat,group=group), fill="whitesmoke")+
+  geom_path(data=malawiDf, aes(long,lat, group=group), color="grey",size=0.1) +
+  geom_sf(data = lakesMw, size=0.25, color=NA,fill="lightblue") +
+  geom_circle(mapping=aes(x0=lon,y0=lat,r=1.25*seroprev),alpha=0.5,col=NA,fill="orange",data=cities) +
+  geom_text(mapping=aes(x=lon,y=lat,label=name),data=cities) +
+  guides() +
+  coord_sf() +
+  theme_opts +
+  ggtitle("April 2021.")
+
+tmp<-datPropStratSampWeight %>%
+  dplyr::filter(month=="2021-07") %>%
+  dplyr::select(location,seropospropAdj)
+
+cities$seroprev<-tmp$seropospropAdj[match(cities$name,tmp$location)]
+
+gJul21<-ggplot() + 
+  geom_polygon(data=malawiDf, aes(long,lat,group=group), fill="whitesmoke")+
+  geom_path(data=malawiDf, aes(long,lat, group=group), color="grey",size=0.1) +
+  geom_sf(data = lakesMw, size=0.25, color=NA,fill="lightblue") +
+  geom_circle(mapping=aes(x0=lon,y0=lat,r=1.25*seroprev),alpha=0.5,col=NA,fill="orange",data=cities) +
+  geom_text(mapping=aes(x=lon,y=lat,label=name),data=cities) +
+  guides() +
+  coord_sf() +
+  theme_opts +
+  ggtitle("July 2021.")
+```
+
+```{r mapBubblePlot2, warning=F, message=F, error=F, results=F}
+datProp<-dat %>%
+  group_by(location) %>%
+  dplyr::summarise(seroposprop=mean(seropos*sampWeight)/sum(sampWeight),
+            seropospropLow=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[1],
+            seropospropHigh=binom.test(x=round(sum(seropos*sampWeight)*(n()/sum(sampWeight))),n=n())$conf.int[2],.groups="drop")
+
+datProp$seropospropAdj<-NA
+datProp$seropospropAdjLow<-NA
+datProp$seropospropAdjHigh<-NA
+
+for(i in 1:nrow(datProp)){
+  tmp<-adjPrevSensSpecCI(prevCI=c(datProp$seropospropLow[i],datProp$seropospropHigh[i]),
+                         sensCI=binom.test(assaySensInd[1],assaySensInd[2])$conf.int,
+                         specCI=binom.test(assaySpecInd[1],assaySpecInd[2])$conf.int,
+                         prev=datProp$seroposprop[i],
+                         sens=assaySensInd[1]/assaySensInd[2],
+                         spec=assaySpecInd[1]/assaySpecInd[2],
+                         N=1e5)
+  datProp$seropospropAdj[i]<-tmp$estimate
+  datProp$seropospropAdjLow[i]<-tmp$conf.int[1]
+  datProp$seropospropAdjHigh[i]<-tmp$conf.int[2]
+}
+
+datProp$seropospropAdjLow[datProp$seropospropAdjLow<=0 | datProp$seropospropAdj<=0]<-0
+datProp$seropospropAdj[datProp$seropospropAdj<=0]<-0
+
+cities$seroprev<-datProp$seropospropAdj[match(cities$name,datProp$location)]
+
+gAll<-ggplot() + 
+  geom_polygon(data=malawiDf, aes(long,lat,group=group), fill="whitesmoke")+
+  geom_path(data=malawiDf, aes(long,lat, group=group), color="grey",size=0.1) +
+  geom_sf(data = lakesMw, size=0.25, color=NA,fill="lightblue") +
+  geom_circle(mapping=aes(x0=lon,y0=lat,r=1.25*seroprev),alpha=0.5,col=NA,fill="orange",data=cities) +
+  geom_text(mapping=aes(x=lon,y=lat,label=name),data=cities) +
+  guides() +
+  coord_sf() +
+  theme_opts +
+  ggtitle("All samples (January 2020 - July 2021).")
+
+
+print(gAll)
+grid.arrange(nrow=2,gApr20,gJul20,gOct20,gJan21,gApr21,gJul21)
+
+png(width=6,height=12,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3a_BubblePlot_AllSamples.png")))
+print(gAll)
+dev.off()
+
+png(width=6,height=12,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3b_BubblePlot_April20.png")))
+print(gApr20)
+dev.off()
+
+png(width=6,height=12,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3c_BubblePlot_July20.png")))
+print(gJul20)
+dev.off()
+
+png(width=6,height=12,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3d_BubblePlot_October20.png")))
+print(gOct20)
+dev.off()
+
+png(width=6,height=12,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3e_BubblePlot_January21.png")))
+print(gJan21)
+dev.off()
+
+png(width=6,height=12,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3f_BubblePlot_April21.png")))
+print(gApr21)
+dev.off()
+
+png(width=6,height=12,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3g_BubblePlot_July21.png")))
+print(gJul21)
+dev.off()
+
+png(width=12,height=6.75,units="in",res=300,file=paste(sep="/",outDir,paste(sep="_",gsub(pattern="-",replacement="",Sys.Date()),"Fig3_BubblePlot_July2020Juy2021.png")))
+grid.arrange(nrow=2,gApr20,gJul20,gOct20,gJan21,gApr21,gJul21)
+dev.off()
+```
